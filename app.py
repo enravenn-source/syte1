@@ -10,23 +10,51 @@ import logging
 
 app = Flask(__name__)
 
-# Настройки из переменных окружения
 API_ID = int(os.environ.get('API_ID', 30095316))
 API_HASH = os.environ.get('API_HASH', 'fd5058fa304a371daf1216f110828222')
 SESSION_STRING = os.environ.get('SESSION_STRING')
 
-# Проверяем наличие сессии
-if SESSION_STRING:
-    # Используем строку сессии из переменных окружения
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    print("✅ Загружена сессия из SESSION_STRING")
-else:
-    # Запасной вариант (для первого запуска)
-    client = TelegramClient('session', API_ID, API_HASH)
-    print("⚠️ SESSION_STRING не найдена, использую файл")
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Создаем клиента
+if SESSION_STRING:
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    logger.info("✅ Загружена сессия из SESSION_STRING")
+else:
+    client = TelegramClient('session', API_ID, API_HASH)
+    logger.info("⚠️ SESSION_STRING не найдена, использую файл")
+
+# Глобальная переменная для статуса авторизации
+auth_status = None
+
+async def check_auth():
+    """Проверка авторизации"""
+    global auth_status
+    try:
+        if not client.is_connected():
+            await client.connect()
+        
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            auth_status = {
+                'status': 'ok',
+                'name': me.first_name,
+                'id': me.id
+            }
+            return True
+        else:
+            auth_status = {
+                'status': 'not_authorized',
+                'message': 'Сессия есть, но аккаунт не авторизован'
+            }
+            return False
+    except Exception as e:
+        auth_status = {
+            'status': 'error',
+            'message': str(e)
+        }
+        return False
 
 HTML = """
 <!DOCTYPE html>
@@ -63,6 +91,16 @@ HTML = """
             text-align: center;
             font-size: 16px;
         }
+        .auth-status {
+            padding: 10px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .auth-ok { background: #d4edda; color: #155724; }
+        .auth-error { background: #f8d7da; color: #721c24; }
+        .auth-warning { background: #fff3cd; color: #856404; }
         input {
             width: 100%;
             padding: 12px;
@@ -83,6 +121,10 @@ HTML = """
             cursor: pointer;
         }
         button:hover { background: #2296d8; }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
         .result {
             margin-top: 20px;
             padding: 15px;
@@ -96,16 +138,31 @@ HTML = """
 <body>
     <div class="container">
         <h1>📱 Поиск контактов</h1>
+        
         <div class="greeting">
             👋 Приветствую тебя, юный рекрутер!<br>
             Забрёл сюда в поисках контакта?<br>
             Вводи номер кандидата и свой тег.
         </div>
         
+        {% if auth %}
+        <div class="auth-status {% if auth.status == 'ok' %}auth-ok{% elif auth.status == 'error' %}auth-error{% else %}auth-warning{% endif %}">
+            {% if auth.status == 'ok' %}
+                ✅ Аккаунт <strong>{{ auth.name }}</strong> (ID: {{ auth.id }}) авторизован
+            {% elif auth.status == 'error' %}
+                ❌ Ошибка авторизации: {{ auth.message }}
+            {% else %}
+                ⚠️ {{ auth.message }}
+            {% endif %}
+        </div>
+        {% endif %}
+        
         <form method="POST" action="/send_contact">
             <input type="text" name="target_phone" placeholder="+79001234567" required>
             <input type="text" name="requester_username" placeholder="твой тег (без @)" required>
-            <button type="submit">🔍 Найти и отправить контакт</button>
+            <button type="submit" {% if auth and auth.status != 'ok' %}disabled{% endif %}>
+                🔍 Найти и отправить контакт
+            </button>
         </form>
         
         {% if result %}
@@ -114,6 +171,7 @@ HTML = """
                 <strong>✅ Готово, проверяй личные сообщения!</strong>
             {% else %}
                 <strong>😕 Кажется, аккаунт полностью скрыт, либо я поломался.</strong>
+                <p style="font-size: 12px; margin-top: 10px;">Ошибка: {{ result.error }}</p>
             {% endif %}
         </div>
         {% endif %}
@@ -122,23 +180,44 @@ HTML = """
 </html>
 """
 
-async def find_and_send(target_phone, requester_username):
+@app.route('/')
+async def index():
+    """Главная страница с проверкой авторизации"""
+    await check_auth()
+    return render_template_string(HTML, auth=auth_status)
+
+@app.route('/send_contact', methods=['POST'])
+async def send_contact():
+    """Отправка контакта"""
+    # Проверяем авторизацию перед отправкой
+    if not await check_auth():
+        return render_template_string(HTML, 
+                                    auth=auth_status, 
+                                    result={'success': False, 'error': 'Аккаунт не авторизован'})
+    
+    target_phone = re.sub(r'[^\d+]', '', request.form['target_phone'])
+    requester_username = request.form['requester_username']
+    
     try:
-        # Проверяем соединение
-        if not client.is_connected():
-            await client.connect()
-        
         # Ищем цель
         contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
         result = await client(ImportContactsRequest([contact]))
         
         if not result.users:
-            return False
+            return render_template_string(HTML, 
+                                        auth=auth_status, 
+                                        result={'success': False, 'error': 'Пользователь не найден'})
         
         user = result.users[0]
         
         # Ищем запросившего
-        requester = await client.get_entity(requester_username)
+        try:
+            requester = await client.get_entity(requester_username)
+        except Exception as e:
+            await client(DeleteContactsRequest([user.id]))
+            return render_template_string(HTML, 
+                                        auth=auth_status, 
+                                        result={'success': False, 'error': f'Username не найден: {e}'})
         
         # Отправляем контакт
         await client.send_message(requester, "Контакт по запросу", file=user)
@@ -146,26 +225,13 @@ async def find_and_send(target_phone, requester_username):
         # Удаляем из контактов
         await client(DeleteContactsRequest([user.id]))
         
-        return True
+        return render_template_string(HTML, auth=auth_status, result={'success': True})
+        
     except Exception as e:
         logger.error(f"Ошибка: {e}")
-        return False
-
-@app.route('/')
-def index():
-    return render_template_string(HTML)
-
-@app.route('/send_contact', methods=['POST'])
-def send_contact():
-    target_phone = re.sub(r'[^\d+]', '', request.form['target_phone'])
-    requester_username = request.form['requester_username']
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    success = loop.run_until_complete(find_and_send(target_phone, requester_username))
-    loop.close()
-    
-    return render_template_string(HTML, result={'success': success})
+        return render_template_string(HTML, 
+                                    auth=auth_status, 
+                                    result={'success': False, 'error': str(e)})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
