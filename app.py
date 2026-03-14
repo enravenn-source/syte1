@@ -28,9 +28,8 @@ logger = logging.getLogger(__name__)
 
 # Глобальный клиент (будет инициализирован при первом запросе)
 client = None
-auth_data = {}  # Временное хранилище для кодов подтверждения
 
-# HTML шаблон для главной страницы
+# HTML шаблон
 INDEX_HTML = """
 <!DOCTYPE html>
 <html>
@@ -113,6 +112,9 @@ INDEX_HTML = """
             padding-top: 10px;
             border-top: 1px solid #ddd;
         }
+        .code-input {
+            margin: 20px 0;
+        }
     </style>
 </head>
 <body>
@@ -125,23 +127,28 @@ INDEX_HTML = """
             Вводи номер кандидата и свой тег.
         </div>
         
-        {% if not authorized %}
+        {% if waiting_code %}
             <div class="result info">
-                <strong>🔐 Требуется авторизация в Telegram</strong>
-                <p>Введи код подтверждения, который придет в Telegram</p>
+                <strong>🔐 Код отправлен на телефон {{ phone }}</strong>
+                <p>Введи код из Telegram</p>
             </div>
             
-            <form method="POST" action="/auth_code">
-                <div class="form-group">
-                    <label>📱 Код из Telegram</label>
-                    <input type="text" name="code" placeholder="12345" required>
-                </div>
-                <button type="submit">Подтвердить код</button>
-            </form>
+            <div class="code-input">
+                <form method="POST" action="/auth_code">
+                    <input type="text" name="code" placeholder="12345" style="text-align: center; font-size: 24px; letter-spacing: 5px;" required>
+                    <button type="submit">Подтвердить код</button>
+                </form>
+            </div>
             
             {% if message %}
                 <div class="result info">{{ message }}</div>
             {% endif %}
+            
+        {% elif not authorized %}
+            <div class="result info">
+                <strong>🔄 Подготовка авторизации...</strong>
+                <p>Пожалуйста, подожди</p>
+            </div>
             
         {% else %}
             <form method="POST" action="/send_contact">
@@ -190,32 +197,51 @@ async def init_client():
         logger.error(f"❌ Ошибка инициализации: {e}")
         return False
 
+async def check_auth():
+    """Проверка авторизации"""
+    if not client or not client.is_connected():
+        await init_client()
+    return await client.is_user_authorized()
+
 @app.route('/')
-def index():
+async def index():
     """Главная страница"""
-    authorized = 'authorized' in session
-    return render_template_string(INDEX_HTML, authorized=authorized)
+    authorized = await check_auth()
+    
+    if not authorized:
+        # Отправляем код
+        try:
+            if not client.is_connected():
+                await client.connect()
+            
+            result = await client.send_code_request(USER_PHONE)
+            session['phone_code_hash'] = result.phone_code_hash
+            session['phone'] = USER_PHONE
+            logger.info(f"📱 Код отправлен на {USER_PHONE}")
+            
+            return render_template_string(INDEX_HTML, waiting_code=True, phone=USER_PHONE)
+        except Exception as e:
+            logger.error(f"❌ Ошибка отправки кода: {e}")
+            return render_template_string(INDEX_HTML, authorized=False, message=f"Ошибка: {str(e)}")
+    
+    return render_template_string(INDEX_HTML, authorized=True)
 
 @app.route('/auth_code', methods=['POST'])
 async def auth_code():
     """Ввод кода подтверждения"""
-    global auth_data
-    
     code = request.form.get('code', '')
     
     if 'phone_code_hash' not in session:
         return render_template_string(INDEX_HTML, authorized=False, message="❌ Сессия истекла, обнови страницу")
     
     try:
-        if not client or not client.is_connected():
-            await init_client()
+        if not client.is_connected():
+            await client.connect()
         
         # Вводим код
         await client.sign_in(phone=USER_PHONE, code=code, phone_code_hash=session['phone_code_hash'])
         
         # Успешно!
-        session['authorized'] = True
-        del session['phone_code_hash']
         logger.info("✅ Авторизация успешна!")
         
         return render_template_string(INDEX_HTML, authorized=True)
@@ -226,34 +252,13 @@ async def auth_code():
         logger.error(f"❌ Ошибка авторизации: {e}")
         return render_template_string(INDEX_HTML, authorized=False, message=f"❌ Ошибка: {str(e)}")
 
-@app.before_request
-async def ensure_client():
-    """Проверка клиента перед каждым запросом"""
-    global client
-    if not client or not client.is_connected():
-        await init_client()
-
-@app.before_request
-async def ensure_auth():
-    """Проверка авторизации"""
-    if request.endpoint in ['auth_code']:
-        return
-    
-    if 'authorized' not in session and not client.is_user_authorized():
-        # Отправляем код
-        try:
-            if not client.is_connected():
-                await client.connect()
-            
-            result = await client.send_code_request(USER_PHONE)
-            session['phone_code_hash'] = result.phone_code_hash
-            logger.info(f"📱 Код отправлен на {USER_PHONE}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка отправки кода: {e}")
-
 @app.route('/send_contact', methods=['POST'])
 async def send_contact():
     """Отправка контакта"""
+    authorized = await check_auth()
+    if not authorized:
+        return render_template_string(INDEX_HTML, authorized=False, waiting_code=True)
+    
     target_phone = request.form.get('target_phone', '')
     requester_username = request.form.get('requester_username', '')
     
