@@ -7,6 +7,7 @@ import re
 import asyncio
 import os
 import logging
+import threading
 
 app = Flask(__name__)
 
@@ -17,24 +18,38 @@ SESSION_STRING = os.environ.get('SESSION_STRING')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Создаем клиента с существующей сессией
+# --- Глобальные объекты для работы с asyncio ---
+# Создаём ЕДИНСТВЕННЫЙ event loop для всего приложения
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+# Создаём и подключаем клиента в этом единственном loop'е
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-# Функция для запуска асинхронных операций
-def run_async(coro):
-    loop = asyncio.new_event_loop()
+def start_loop():
+    """Запускает цикл событий в отдельном потоке, где он будет жить вечно."""
     asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    loop.run_forever()
 
-# Подключаемся при старте
-async def startup():
+# Запускаем поток, который будет крутить наш главный loop
+threading.Thread(target=start_loop, daemon=True).start()
+
+# Теперь можно безопасно отправлять задачи в этот loop из любого места
+async def connect_client():
     await client.connect()
-    logger.info("✅ Клиент подключен")
+    logger.info("✅ Клиент подключен в главном loop'е")
 
-run_async(startup())
+# Отправляем задачу на подключение в главный loop
+future = asyncio.run_coroutine_threadsafe(connect_client(), loop)
+future.result() # Ждем, пока подключится (это выполнится быстро)
+
+# --- Конец инициализации asyncio ---
+
+# Функция для вызова асинхронных операций из синхронного кода Flask
+def run_async_in_main_loop(coro):
+    """Запускает корутину в главном loop'е и возвращает результат."""
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result()
 
 HTML = """
 <!DOCTYPE html>
@@ -167,8 +182,10 @@ def send_contact():
             logger.error(f"Ошибка: {e}")
             return {'success': False, 'message': str(e)}
     
-    result = run_async(process())
+    # Запускаем асинхронную задачу в ГЛАВНОМ loop'е, а не в новом
+    result = run_async_in_main_loop(process())
     return render_template_string(HTML, result=result)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, threaded=True)
