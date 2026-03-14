@@ -7,6 +7,7 @@ import re
 import asyncio
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 
@@ -17,44 +18,14 @@ SESSION_STRING = os.environ.get('SESSION_STRING')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Создаем клиента
-if SESSION_STRING:
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    logger.info("✅ Загружена сессия из SESSION_STRING")
-else:
-    client = TelegramClient('session', API_ID, API_HASH)
-    logger.info("⚠️ SESSION_STRING не найдена, использую файл")
+# Единый event loop для всех операций
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 
-# Глобальная переменная для статуса авторизации
-auth_status = None
-
-async def check_auth():
-    """Проверка авторизации"""
-    global auth_status
-    try:
-        if not client.is_connected():
-            await client.connect()
-        
-        if await client.is_user_authorized():
-            me = await client.get_me()
-            auth_status = {
-                'status': 'ok',
-                'name': me.first_name,
-                'id': me.id
-            }
-            return True
-        else:
-            auth_status = {
-                'status': 'not_authorized',
-                'message': 'Сессия есть, но аккаунт не авторизован'
-            }
-            return False
-    except Exception as e:
-        auth_status = {
-            'status': 'error',
-            'message': str(e)
-        }
-        return False
+# Создаем клиента с единым loop'ом
+client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+loop.run_until_complete(client.connect())
+logger.info("✅ Клиент подключен в главном loop'е")
 
 HTML = """
 <!DOCTYPE html>
@@ -100,7 +71,6 @@ HTML = """
         }
         .auth-ok { background: #d4edda; color: #155724; }
         .auth-error { background: #f8d7da; color: #721c24; }
-        .auth-warning { background: #fff3cd; color: #856404; }
         input {
             width: 100%;
             padding: 12px;
@@ -121,10 +91,6 @@ HTML = """
             cursor: pointer;
         }
         button:hover { background: #2296d8; }
-        button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-        }
         .result {
             margin-top: 20px;
             padding: 15px;
@@ -145,24 +111,10 @@ HTML = """
             Вводи номер кандидата и свой тег.
         </div>
         
-        {% if auth %}
-        <div class="auth-status {% if auth.status == 'ok' %}auth-ok{% elif auth.status == 'error' %}auth-error{% else %}auth-warning{% endif %}">
-            {% if auth.status == 'ok' %}
-                ✅ Аккаунт <strong>{{ auth.name }}</strong> (ID: {{ auth.id }}) авторизован
-            {% elif auth.status == 'error' %}
-                ❌ Ошибка авторизации: {{ auth.message }}
-            {% else %}
-                ⚠️ {{ auth.message }}
-            {% endif %}
-        </div>
-        {% endif %}
-        
         <form method="POST" action="/send_contact">
             <input type="text" name="target_phone" placeholder="+79001234567" required>
             <input type="text" name="requester_username" placeholder="твой тег (без @)" required>
-            <button type="submit" {% if auth and auth.status != 'ok' %}disabled{% endif %}>
-                🔍 Найти и отправить контакт
-            </button>
+            <button type="submit">🔍 Найти и отправить контакт</button>
         </form>
         
         {% if result %}
@@ -170,8 +122,7 @@ HTML = """
             {% if result.success %}
                 <strong>✅ Готово, проверяй личные сообщения!</strong>
             {% else %}
-                <strong>😕 Кажется, аккаунт полностью скрыт, либо я поломался.</strong>
-                <p style="font-size: 12px; margin-top: 10px;">Ошибка: {{ result.error }}</p>
+                <strong>😕 {{ result.message }}</strong>
             {% endif %}
         </div>
         {% endif %}
@@ -180,58 +131,56 @@ HTML = """
 </html>
 """
 
+def run_async(coro):
+    """Запускает корутину в едином loop'е и возвращает результат"""
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result()
+
 @app.route('/')
-async def index():
-    """Главная страница с проверкой авторизации"""
-    await check_auth()
-    return render_template_string(HTML, auth=auth_status)
+def index():
+    return render_template_string(HTML)
 
 @app.route('/send_contact', methods=['POST'])
-async def send_contact():
-    """Отправка контакта"""
-    # Проверяем авторизацию перед отправкой
-    if not await check_auth():
-        return render_template_string(HTML, 
-                                    auth=auth_status, 
-                                    result={'success': False, 'error': 'Аккаунт не авторизован'})
-    
+def send_contact():
     target_phone = re.sub(r'[^\d+]', '', request.form['target_phone'])
     requester_username = request.form['requester_username']
     
-    try:
-        # Ищем цель
-        contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
-        result = await client(ImportContactsRequest([contact]))
-        
-        if not result.users:
-            return render_template_string(HTML, 
-                                        auth=auth_status, 
-                                        result={'success': False, 'error': 'Пользователь не найден'})
-        
-        user = result.users[0]
-        
-        # Ищем запросившего
+    async def process():
         try:
-            requester = await client.get_entity(requester_username)
-        except Exception as e:
+            # Проверяем авторизацию
+            if not await client.is_user_authorized():
+                return {'success': False, 'message': 'Аккаунт не авторизован'}
+            
+            # Ищем цель
+            contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
+            result = await client(ImportContactsRequest([contact]))
+            
+            if not result.users:
+                return {'success': False, 'message': 'Пользователь не найден'}
+            
+            user = result.users[0]
+            
+            # Ищем запросившего
+            try:
+                requester = await client.get_entity(requester_username)
+            except Exception as e:
+                await client(DeleteContactsRequest([user.id]))
+                return {'success': False, 'message': f'Username не найден: {requester_username}'}
+            
+            # Отправляем контакт
+            await client.send_message(requester, "Контакт по запросу", file=user)
+            
+            # Удаляем из контактов
             await client(DeleteContactsRequest([user.id]))
-            return render_template_string(HTML, 
-                                        auth=auth_status, 
-                                        result={'success': False, 'error': f'Username не найден: {e}'})
-        
-        # Отправляем контакт
-        await client.send_message(requester, "Контакт по запросу", file=user)
-        
-        # Удаляем из контактов
-        await client(DeleteContactsRequest([user.id]))
-        
-        return render_template_string(HTML, auth=auth_status, result={'success': True})
-        
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        return render_template_string(HTML, 
-                                    auth=auth_status, 
-                                    result={'success': False, 'error': str(e)})
+            
+            return {'success': True, 'message': ''}
+            
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+            return {'success': False, 'message': str(e)}
+    
+    result = run_async(process())
+    return render_template_string(HTML, result=result)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
