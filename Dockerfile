@@ -7,5 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Запускаем приложение через python, а не gunicorn
-CMD python app.py
+CMD gunicorn --worker-class gevent --timeout 120 --bind 0.0.0.0:5000 app:app
