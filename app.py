@@ -1,8 +1,7 @@
 from flask import Flask, request, render_template_string
 from telethon import TelegramClient
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
-from telethon.tl.types import InputPhoneContact, InputMediaContact
-from telethon.tl.functions.messages import SendMediaRequest
+from telethon.tl.types import InputPhoneContact
 import re
 import asyncio
 import os
@@ -16,7 +15,7 @@ API_ID = int(os.environ.get('API_ID', 0))
 API_HASH = os.environ.get('API_HASH', '')
 USER_PHONE = os.environ.get('USER_PHONE', '')
 
-# Путь для сохранения сессии (в Volume)
+# Путь для сохранения сессии
 SESSION_PATH = '/app/data/session'
 
 logging.basicConfig(level=logging.INFO)
@@ -122,14 +121,24 @@ HTML = """
 # Создаем клиента один раз при старте
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 
-@app.before_first_request
-async def startup():
-    """Автоматическая авторизация при первом запросе"""
-    if not client.is_connected():
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.send_code_request(USER_PHONE)
-            # Ждем код (потребуется ввести через Railway Console)
+# Инициализация при старте (без before_first_request)
+def init_client_sync():
+    """Синхронная инициализация клиента"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        if not client.is_connected():
+            loop.run_until_complete(client.connect())
+            if not loop.run_until_complete(client.is_user_authorized()):
+                logger.info("Клиент не авторизован. Требуется вход через консоль.")
+                # Не отправляем код автоматически, ждем ручного ввода
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации: {e}")
+    finally:
+        loop.close()
+
+# Запускаем инициализацию при загрузке модуля
+init_client_sync()
 
 @app.route('/')
 def index():
@@ -144,6 +153,14 @@ def send_contact():
     
     async def process():
         try:
+            # Подключаемся если нужно
+            if not client.is_connected():
+                await client.connect()
+            
+            # Проверяем авторизацию
+            if not await client.is_user_authorized():
+                return {'success': False, 'error': 'not_authorized'}
+            
             # Ищем цель
             contact = InputPhoneContact(client_id=0, phone=clean_phone, first_name="", last_name="")
             result = await client(ImportContactsRequest([contact]))
@@ -154,7 +171,11 @@ def send_contact():
             user = result.users[0]
             
             # Ищем запросившего
-            requester = await client.get_entity(requester_username)
+            try:
+                requester = await client.get_entity(requester_username)
+            except:
+                await client(DeleteContactsRequest([user.id]))
+                return {'success': False}
             
             # Отправляем контакт
             await client.send_message(
