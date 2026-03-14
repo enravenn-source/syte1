@@ -1,16 +1,14 @@
-from quart import Quart, request, render_template_string
+from flask import Flask, request, render_template_string
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
 from telethon.tl.types import InputPhoneContact
 import re
+import asyncio
 import os
 import logging
-import asyncio
-from hypercorn.config import Config
-from hypercorn.asyncio import serve
 
-app = Quart(__name__)
+app = Flask(__name__)
 
 API_ID = int(os.environ.get('API_ID', 30095316))
 API_HASH = os.environ.get('API_HASH', 'fd5058fa304a371daf1216f110828222')
@@ -19,18 +17,24 @@ SESSION_STRING = os.environ.get('SESSION_STRING')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Создаем клиента и подключаемся при старте
+# Создаем клиента с существующей сессией
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-@app.before_serving
+# Функция для запуска асинхронных операций
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+# Подключаемся при старте
 async def startup():
     await client.connect()
     logger.info("✅ Клиент подключен")
 
-@app.after_serving
-async def shutdown():
-    await client.disconnect()
-    logger.info("👋 Клиент отключен")
+run_async(startup())
 
 HTML = """
 <!DOCTYPE html>
@@ -127,48 +131,44 @@ HTML = """
 """
 
 @app.route('/')
-async def index():
-    return await render_template_string(HTML)
+def index():
+    return render_template_string(HTML)
 
 @app.route('/send_contact', methods=['POST'])
-async def send_contact():
-    target_phone = re.sub(r'[^\d+]', '', (await request.form)['target_phone'])
-    requester_username = (await request.form)['requester_username']
+def send_contact():
+    target_phone = re.sub(r'[^\d+]', '', request.form['target_phone'])
+    requester_username = request.form['requester_username']
     
-    try:
-        # Проверяем авторизацию
-        if not await client.is_user_authorized():
-            return await render_template_string(HTML, result={'success': False, 'message': 'Аккаунт не авторизован'})
-        
-        # Ищем цель
-        contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
-        result = await client(ImportContactsRequest([contact]))
-        
-        if not result.users:
-            return await render_template_string(HTML, result={'success': False, 'message': 'Пользователь не найден'})
-        
-        user = result.users[0]
-        
-        # Ищем запросившего
+    async def process():
         try:
-            requester = await client.get_entity(requester_username)
-        except Exception:
+            if not await client.is_user_authorized():
+                return {'success': False, 'message': 'Аккаунт не авторизован'}
+            
+            contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
+            result = await client(ImportContactsRequest([contact]))
+            
+            if not result.users:
+                return {'success': False, 'message': 'Пользователь не найден'}
+            
+            user = result.users[0]
+            
+            try:
+                requester = await client.get_entity(requester_username)
+            except Exception:
+                await client(DeleteContactsRequest([user.id]))
+                return {'success': False, 'message': f'Username не найден: {requester_username}'}
+            
+            await client.send_message(requester, "Контакт по запросу", file=user)
             await client(DeleteContactsRequest([user.id]))
-            return await render_template_string(HTML, result={'success': False, 'message': f'Username не найден: {requester_username}'})
-        
-        # Отправляем контакт
-        await client.send_message(requester, "Контакт по запросу", file=user)
-        
-        # Удаляем из контактов
-        await client(DeleteContactsRequest([user.id]))
-        
-        return await render_template_string(HTML, result={'success': True, 'message': ''})
-        
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        return await render_template_string(HTML, result={'success': False, 'message': str(e)})
+            
+            return {'success': True, 'message': ''}
+            
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+            return {'success': False, 'message': str(e)}
+    
+    result = run_async(process())
+    return render_template_string(HTML, result=result)
 
 if __name__ == '__main__':
-    config = Config()
-    config.bind = ["0.0.0.0:5000"]
-    asyncio.run(serve(app, config))
+    app.run(host='0.0.0.0', port=5000)
