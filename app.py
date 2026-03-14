@@ -1,15 +1,16 @@
-from flask import Flask, request, render_template_string
+from quart import Quart, request, render_template_string
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
 from telethon.tl.types import InputPhoneContact
 import re
-import asyncio
 import os
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
+from hypercorn.config import Config
+from hypercorn.asyncio import serve
 
-app = Flask(__name__)
+app = Quart(__name__)
 
 API_ID = int(os.environ.get('API_ID', 30095316))
 API_HASH = os.environ.get('API_HASH', 'fd5058fa304a371daf1216f110828222')
@@ -18,14 +19,18 @@ SESSION_STRING = os.environ.get('SESSION_STRING')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Единый event loop для всех операций
-loop = asyncio.new_event_loop()
-asyncio.set_event_loop(loop)
-
-# Создаем клиента с единым loop'ом
+# Создаем клиента и подключаемся при старте
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-loop.run_until_complete(client.connect())
-logger.info("✅ Клиент подключен в главном loop'е")
+
+@app.before_serving
+async def startup():
+    await client.connect()
+    logger.info("✅ Клиент подключен")
+
+@app.after_serving
+async def shutdown():
+    await client.disconnect()
+    logger.info("👋 Клиент отключен")
 
 HTML = """
 <!DOCTYPE html>
@@ -62,15 +67,6 @@ HTML = """
             text-align: center;
             font-size: 16px;
         }
-        .auth-status {
-            padding: 10px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            text-align: center;
-            font-weight: bold;
-        }
-        .auth-ok { background: #d4edda; color: #155724; }
-        .auth-error { background: #f8d7da; color: #721c24; }
         input {
             width: 100%;
             padding: 12px;
@@ -104,7 +100,6 @@ HTML = """
 <body>
     <div class="container">
         <h1>📱 Поиск контактов</h1>
-        
         <div class="greeting">
             👋 Приветствую тебя, юный рекрутер!<br>
             Забрёл сюда в поисках контакта?<br>
@@ -131,57 +126,49 @@ HTML = """
 </html>
 """
 
-def run_async(coro):
-    """Запускает корутину в едином loop'е и возвращает результат"""
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result()
-
 @app.route('/')
-def index():
-    return render_template_string(HTML)
+async def index():
+    return await render_template_string(HTML)
 
 @app.route('/send_contact', methods=['POST'])
-def send_contact():
-    target_phone = re.sub(r'[^\d+]', '', request.form['target_phone'])
-    requester_username = request.form['requester_username']
+async def send_contact():
+    target_phone = re.sub(r'[^\d+]', '', (await request.form)['target_phone'])
+    requester_username = (await request.form)['requester_username']
     
-    async def process():
+    try:
+        # Проверяем авторизацию
+        if not await client.is_user_authorized():
+            return await render_template_string(HTML, result={'success': False, 'message': 'Аккаунт не авторизован'})
+        
+        # Ищем цель
+        contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
+        result = await client(ImportContactsRequest([contact]))
+        
+        if not result.users:
+            return await render_template_string(HTML, result={'success': False, 'message': 'Пользователь не найден'})
+        
+        user = result.users[0]
+        
+        # Ищем запросившего
         try:
-            # Проверяем авторизацию
-            if not await client.is_user_authorized():
-                return {'success': False, 'message': 'Аккаунт не авторизован'}
-            
-            # Ищем цель
-            contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
-            result = await client(ImportContactsRequest([contact]))
-            
-            if not result.users:
-                return {'success': False, 'message': 'Пользователь не найден'}
-            
-            user = result.users[0]
-            
-            # Ищем запросившего
-            try:
-                requester = await client.get_entity(requester_username)
-            except Exception as e:
-                await client(DeleteContactsRequest([user.id]))
-                return {'success': False, 'message': f'Username не найден: {requester_username}'}
-            
-            # Отправляем контакт
-            await client.send_message(requester, "Контакт по запросу", file=user)
-            
-            # Удаляем из контактов
+            requester = await client.get_entity(requester_username)
+        except Exception:
             await client(DeleteContactsRequest([user.id]))
-            
-            return {'success': True, 'message': ''}
-            
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            return {'success': False, 'message': str(e)}
-    
-    result = run_async(process())
-    return render_template_string(HTML, result=result)
+            return await render_template_string(HTML, result={'success': False, 'message': f'Username не найден: {requester_username}'})
+        
+        # Отправляем контакт
+        await client.send_message(requester, "Контакт по запросу", file=user)
+        
+        # Удаляем из контактов
+        await client(DeleteContactsRequest([user.id]))
+        
+        return await render_template_string(HTML, result={'success': True, 'message': ''})
+        
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        return await render_template_string(HTML, result={'success': False, 'message': str(e)})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    config = Config()
+    config.bind = ["0.0.0.0:5000"]
+    asyncio.run(serve(app, config))
