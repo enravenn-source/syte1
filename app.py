@@ -2,7 +2,7 @@ from flask import Flask, request, render_template_string
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
-from telethon.tl.types import InputPhoneContact
+from telethon.tl.types import InputPhoneContact, InputMediaContact
 import re
 import asyncio
 import os
@@ -18,36 +18,31 @@ SESSION_STRING = os.environ.get('SESSION_STRING')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Глобальные объекты для работы с asyncio ---
-# Создаём ЕДИНСТВЕННЫЙ event loop для всего приложения
+# --- Единый event loop для всего приложения ---
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
-# Создаём и подключаем клиента в этом единственном loop'е
+# Создаем клиента
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 def start_loop():
-    """Запускает цикл событий в отдельном потоке, где он будет жить вечно."""
+    """Запускает цикл событий в отдельном потоке"""
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-# Запускаем поток, который будет крутить наш главный loop
+# Запускаем поток с главным loop'ом
 threading.Thread(target=start_loop, daemon=True).start()
 
-# Теперь можно безопасно отправлять задачи в этот loop из любого места
 async def connect_client():
     await client.connect()
     logger.info("✅ Клиент подключен в главном loop'е")
 
-# Отправляем задачу на подключение в главный loop
+# Подключаем клиента
 future = asyncio.run_coroutine_threadsafe(connect_client(), loop)
-future.result() # Ждем, пока подключится (это выполнится быстро)
+future.result()
 
-# --- Конец инициализации asyncio ---
-
-# Функция для вызова асинхронных операций из синхронного кода Flask
 def run_async_in_main_loop(coro):
-    """Запускает корутину в главном loop'е и возвращает результат."""
+    """Запускает корутину в главном loop'е и возвращает результат"""
     future = asyncio.run_coroutine_threadsafe(coro, loop)
     return future.result()
 
@@ -159,22 +154,39 @@ def send_contact():
             if not await client.is_user_authorized():
                 return {'success': False, 'message': 'Аккаунт не авторизован'}
             
+            # Ищем цель
             contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
             result = await client(ImportContactsRequest([contact]))
             
             if not result.users:
                 return {'success': False, 'message': 'Пользователь не найден'}
             
-            user = result.users[0]
+            target_user = result.users[0]
             
+            # Ищем запросившего
             try:
                 requester = await client.get_entity(requester_username)
             except Exception:
-                await client(DeleteContactsRequest([user.id]))
+                await client(DeleteContactsRequest([target_user.id]))
                 return {'success': False, 'message': f'Username не найден: {requester_username}'}
             
-            await client.send_message(requester, "Контакт по запросу", file=user)
-            await client(DeleteContactsRequest([user.id]))
+            # СОЗДАЕМ МЕДИА-КОНТАКТ для отправки
+            media_contact = InputMediaContact(
+                phone_number=target_phone,
+                first_name=target_user.first_name or "",
+                last_name=target_user.last_name or "",
+                vcard=""
+            )
+            
+            # Отправляем контакт как медиа
+            await client.send_message(
+                requester,
+                "Контакт по запросу",
+                file=media_contact
+            )
+            
+            # Удаляем из контактов
+            await client(DeleteContactsRequest([target_user.id]))
             
             return {'success': True, 'message': ''}
             
@@ -182,10 +194,9 @@ def send_contact():
             logger.error(f"Ошибка: {e}")
             return {'success': False, 'message': str(e)}
     
-    # Запускаем асинхронную задачу в ГЛАВНОМ loop'е, а не в новом
     result = run_async_in_main_loop(process())
     return render_template_string(HTML, result=result)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, threaded=True)
+    app.run(host='0.0.0.0', port=5000, threaded=True)
