@@ -1,24 +1,32 @@
 from flask import Flask, request, render_template_string
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
-from telethon.tl.types import InputPhoneContact, InputMediaContact
-from telethon.tl.functions.messages import SendMediaRequest
+from telethon.tl.types import InputPhoneContact
 import re
 import asyncio
 import os
-import random
 import logging
 
 app = Flask(__name__)
 
+# Настройки из переменных окружения
 API_ID = int(os.environ.get('API_ID', 30095316))
 API_HASH = os.environ.get('API_HASH', 'fd5058fa304a371daf1216f110828222')
-USER_PHONE = os.environ.get('USER_PHONE', '+79923018941')
+SESSION_STRING = os.environ.get('SESSION_STRING')
+
+# Проверяем наличие сессии
+if SESSION_STRING:
+    # Используем строку сессии из переменных окружения
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    print("✅ Загружена сессия из SESSION_STRING")
+else:
+    # Запасной вариант (для первого запуска)
+    client = TelegramClient('session', API_ID, API_HASH)
+    print("⚠️ SESSION_STRING не найдена, использую файл")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-client = TelegramClient('session', API_ID, API_HASH)
 
 HTML = """
 <!DOCTYPE html>
@@ -116,6 +124,10 @@ HTML = """
 
 async def find_and_send(target_phone, requester_username):
     try:
+        # Проверяем соединение
+        if not client.is_connected():
+            await client.connect()
+        
         # Ищем цель
         contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
         result = await client(ImportContactsRequest([contact]))
