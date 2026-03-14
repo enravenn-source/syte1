@@ -16,7 +16,7 @@ API_HASH = os.environ.get('API_HASH', '')
 USER_PHONE = os.environ.get('USER_PHONE', '')
 
 # Путь для сохранения сессии
-SESSION_PATH = '/app/data/session'
+SESSION_PATH = 'session.session'
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
