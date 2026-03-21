@@ -3,6 +3,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.contacts import ImportContactsRequest, DeleteContactsRequest
 from telethon.tl.types import InputPhoneContact, InputMediaContact
+from telethon.tl.functions.messages import SendMediaRequest
 import re
 import asyncio
 import os
@@ -154,6 +155,9 @@ def send_contact():
             if not await client.is_user_authorized():
                 return {'success': False, 'message': 'Аккаунт не авторизован'}
             
+            # Задержка перед поиском
+            await asyncio.sleep(1)
+            
             # Ищем цель
             contact = InputPhoneContact(client_id=0, phone=target_phone, first_name="", last_name="")
             result = await client(ImportContactsRequest([contact]))
@@ -161,24 +165,30 @@ def send_contact():
             if not result.users:
                 return {'success': False, 'message': 'Пользователь не найден'}
             
-            target_user = result.users[0]
+            user = result.users[0]
+            
+            # Задержка перед получением entity
+            await asyncio.sleep(0.5)
             
             # Ищем запросившего
             try:
                 requester = await client.get_entity(requester_username)
             except Exception:
-                await client(DeleteContactsRequest([target_user.id]))
+                await client(DeleteContactsRequest([user.id]))
                 return {'success': False, 'message': f'Username не найден: {requester_username}'}
             
-            # СОЗДАЕМ МЕДИА-КОНТАКТ для отправки
+            # Задержка перед отправкой
+            await asyncio.sleep(0.5)
+            
+            # Создаем медиа-контакт
             media_contact = InputMediaContact(
                 phone_number=target_phone,
-                first_name=target_user.first_name or "",
-                last_name=target_user.last_name or "",
+                first_name=user.first_name or "",
+                last_name=user.last_name or "",
                 vcard=""
             )
             
-            # Отправляем контакт как медиа
+            # Отправляем контакт
             await client.send_message(
                 requester,
                 "Контакт по запросу",
@@ -186,17 +196,22 @@ def send_contact():
             )
             
             # Удаляем из контактов
-            await client(DeleteContactsRequest([target_user.id]))
+            await client(DeleteContactsRequest([user.id]))
             
             return {'success': True, 'message': ''}
             
         except Exception as e:
             logger.error(f"Ошибка: {e}")
-            return {'success': False, 'message': str(e)}
+            error_msg = str(e)
+            if "Too many requests" in error_msg:
+                return {'success': False, 'message': 'Слишком много запросов. Подожди минуту и попробуй снова.'}
+            if "FLOOD_WAIT" in error_msg:
+                return {'success': False, 'message': 'Telegram временно ограничил аккаунт. Подожди несколько минут.'}
+            return {'success': False, 'message': error_msg}
     
     result = run_async_in_main_loop(process())
     return render_template_string(HTML, result=result)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    app.run(host='0.0.0.0', port=port, threaded=True)True)
